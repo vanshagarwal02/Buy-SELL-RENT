@@ -468,6 +468,319 @@ app.get('/api/product/:id', async (req, res) => {
     }
 });
 
+app.get('/api/cart', isAuthenticated, async (req, res) => {
+    try {
+        const cartItems = await Cart.find({
+            userId: req.session.userId
+        });
+        // console.log('Raw Cart Items:', cartItems);
+        if (cartItems.length > 0) {
+            const cartItemsWithProducts = await Cart.aggregate([
+                {
+                    $match: { userId: new mongoose.Types.ObjectId(req.session.userId) } 
+                },
+                {
+                    $lookup: {
+                        from: 'products', 
+                        localField: 'productId', 
+                        foreignField: '_id', 
+                        as: 'product'
+                    }
+                },
+                {
+                    $unwind: '$product'
+                },
+                {
+                    $lookup: {
+                        from: 'users',
+                        localField: 'product.sellerId', 
+                        foreignField: '_id',
+                        as: 'seller'
+                    }
+                },
+                {
+                    $unwind: '$seller'
+                },
+                {
+                    $project: {
+                        _id: 1, 
+                        userId: 1,
+                        productId: 1,
+                        quantity: 1,
+                        'product.name': 1,
+                        'product.price': 1,
+                        'product.description': 1,
+                        'product.category': 1,
+                        'seller.firstName': 1,
+                        'seller.lastName': 1,
+                        'seller.email': 1
+                    }
+                }
+            ]);
+            // console.log('Aggregated Cart Items:', cartItemsWithProducts);
+            res.json(cartItemsWithProducts);
+        } else {
+            res.json([]);
+        }
+    } catch (error) {
+        console.error('Cart Fetch Error:', error);
+        res.status(500).json({
+            message: 'Error fetching cart items',
+            error: error.toString()
+        });
+    }
+});
+app.post('/api/cart/add', isAuthenticated, async (req, res) => {
+    try {
+        const { productId, quantity } = req.body;
+        const product = await Product.findById(productId);
+        if (!product) {
+            return res.status(404).json({ message: 'Product not found' });
+        }
+        const existingCartItem = await Cart.findOne({
+            userId: req.session.userId,
+            productId
+        });
+        if (existingCartItem) {
+            existingCartItem.quantity += quantity;
+            await existingCartItem.save();
+        } else {
+            await Cart.create({
+                userId: req.session.userId,
+                productId,
+                quantity
+            });
+        }
+        res.status(201).json({ message: 'Added to cart successfully' });
+    } catch (error) {
+        res.status(500).json({ message: 'Error adding to cart' });
+    }
+});
+
+
+app.get('/api/cart/check', isAuthenticated, async (req, res) => {
+    try {
+        const { productId } = req.query;
+        const cartItem = await Cart.findOne({
+            userId: req.session.userId,
+            productId
+        });
+        res.json({ inCart: !!cartItem });
+    } catch (error) {
+        res.status(500).json({ message: 'Error checking cart status' });
+    }
+});
+
+app.put('/api/cart/update', isAuthenticated, async (req, res) => {
+    try {
+        const { productId, quantity } = req.body;
+        if (quantity < 1) {
+            return res.status(400).json({ message: 'Quantity must be at least 1' });
+        }
+        // console.log(req.session.userId);
+        // console.log(productId);
+        const cartItem = await Cart.findOneAndUpdate(
+            {
+                userId: req.session.userId, 
+                productId:(productId)
+            },
+            { quantity },
+            {
+                new: true,
+                runValidators: true
+            }
+        ).populate('productId');
+        if (!cartItem) {
+            return res.status(404).json({
+                message: 'Cart item not found',
+                details: {
+                    userId: req.session.userId,
+                    productId: productId
+                }
+            });
+        }
+        res.json(cartItem);
+    } catch (error) {
+        console.error('Cart update error:', error);
+        res.status(500).json({
+            message: 'Error updating cart item',
+            error: error.message
+        });
+    }
+});
+
+app.delete('/api/cart/:productId', isAuthenticated, async (req, res) => {
+    try {
+        const result = await Cart.findOneAndDelete({
+            userId: req.session.userId,
+            productId: new mongoose.Types.ObjectId(req.params.productId)
+        });
+        if (result) {
+            res.json({
+                message: 'Removed from cart successfully',
+                deletedItem: result
+            });
+        } else {
+            res.status(404).json({
+                message: 'Item not found in cart',
+                details: {
+                    userId: req.session.userId,
+                    productId: req.params.productId
+                }
+            });
+        }
+    } catch (error) {
+        console.error('Cart removal error:', error);
+        res.status(500).json({
+            message: 'Error removing from cart',
+            error: error.message
+        });
+    }
+});
+
+app.post('/api/orders', isAuthenticated, async (req, res) => {
+    const { cartItems } = req.body;
+    const session = await mongoose.startSession();
+    try {
+        session.startTransaction();
+        const orders = await Promise.all(cartItems.map(async (item) => {
+            const product = await Product.findById(item.productId);
+            otp = Math.floor(100000 + Math.random() * 900000).toString()
+            const hashedOtp = await bcrypt.hash(otp, 10);
+            const order = new Order({
+                userId: req.session.userId,
+                productId: item.productId,
+                sellerId: product.sellerId, 
+                quantity: item.quantity,
+                otp: hashedOtp
+            });
+            await order.save({ session });
+            return order;
+        }));
+        await Cart.deleteMany({ userId: req.session.userId }).session(session);
+        await session.commitTransaction();
+        session.endSession();
+        res.status(201).json({
+            message: 'Orders placed successfully',
+            orders
+        });
+    } catch (error) {
+        await session.abortTransaction();
+        session.endSession();
+        console.error('Order placement error:', error);
+        res.status(500).json({
+            message: 'Error placing orders',
+            error: error.message
+        });
+    }
+});
+
+app.post('/api/reviews/add', async (req, res) => {
+    try {
+        const { orderId, review } = req.body;
+        const order = await Order.findById(orderId)
+            .populate('sellerId')
+            .populate('productId');
+        if (!order) {
+            return res.status(404).json({ message: 'Order not found' });
+        }
+        await User.findByIdAndUpdate(
+            order.sellerId._id,
+            { $push: { reviews: review } }
+        );
+
+        res.status(200).json({ message: 'Review added successfully' });
+    } catch (error) {
+        console.error('Error adding review:', error);
+        res.status(500).json({ message: 'Error adding review' });
+    }
+});
+
+app.post('/api/orders/:orderId/regenerate-otp', async (req, res) => {
+    try {
+        const { orderId } = req.params;
+        const newOtp = Math.floor(100000 + Math.random() * 900000).toString();
+        const hashedOtp = await bcrypt.hash(newOtp, 10);
+        const updatedOrder = await Order.findByIdAndUpdate(
+            orderId,
+            { otp: hashedOtp },
+            { new: true }
+        );
+        if (!updatedOrder) {
+            return res.status(404).json({ message: 'Order not found' });
+        }
+        res.status(200).json({
+            message: 'OTP regenerated successfully',
+            otp: newOtp
+        });
+    } catch (error) {
+        console.error('Error regenerating OTP:', error);
+        res.status(500).json({ message: 'Error regenerating OTP' });
+    }
+});
+
+app.get('/api/seller/undelivered-orders', async (req, res) => {
+    try {
+        const sellerId = req.session.userId;
+        const undeliveredOrders = await Order.find({
+            sellerId: sellerId,
+            isDelivered: false
+        }).populate('productId') .populate('userId');
+        // console.log(undeliveredOrders);
+        res.status(200).json(undeliveredOrders);
+    } catch (error) {
+        console.error('Error fetching undelivered orders:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
+
+app.post('/api/seller/confirm-delivery', async (req, res) => {
+    const { orderId, otp } = req.body;
+    try {
+        const order = await Order.findById(orderId);
+        if (!order) {
+            return res.status(404).json({ message: 'Order not found' });
+        }
+        const isMatch = await bcrypt.compare(otp, order.otp);
+        if (!isMatch) {
+            return res.status(400).json({ message: 'Invalid OTP' });
+        }
+        order.isDelivered = true;
+        await order.save();
+        res.status(200).json({ message: 'Delivery confirmed successfully' });
+    } catch (error) {
+        console.error('Error confirming delivery:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
+
+app.get('/api/orders/bought', isAuthenticated, async (req, res) => {
+    try {
+        const orders = await Order.find({ userId: req.session.userId })
+            .populate('productId') .populate('sellerId')
+            .sort({ orderDate: -1 });
+        // console.log('bought items',orders);
+        res.json(orders);
+    } catch (error) {
+        console.error('Error fetching bought orders:', error);
+        res.status(500).json({ message: 'Error fetching orders', error: error.message });
+    }
+});
+
+app.get('/api/orders/sold', isAuthenticated, async (req, res) => {
+    try {
+        const orders = await Order.find({ sellerId: req.session.userId, isDelivered: true })
+            .populate('productId')
+            .populate('userId')
+            .sort({ orderDate: -1 });
+        // console.log('sold items',orders);
+        res.json(orders);
+    } catch (error) {
+        console.error('Error fetching sold orders:', error);
+        res.status(500).json({ message: 'Error fetching orders', error: error.message });
+    }
+});
+
 app.use(express.static(path.join(__dirname, '../frontend/my-app/build')));
 
 app.get('*', (req, res) => {
